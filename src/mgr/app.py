@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+import subprocess
 from datetime import date
 from pathlib import Path
 
 from rich.text import Text
 from textual import on
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Footer, Input, Label, Markdown, OptionList, Select, Static, TextArea
 from textual.widgets.option_list import Option
 
-from mgr import export, model, store
-from mgr.model import BOARD_ORDER, KINDS, PRIORITIES, Idea, Plan, Status
+from mgr import export, model, notes, search, store
+from mgr.model import BOARD_ORDER, KINDS, PRIORITIES, Idea, Plan, Status, window_label
 
 PRIORITY_STYLE = {0: ("  ", ""), 1: ("!!", "bold red"), 2: ("↑ ", "dark_orange"), 3: ("= ", "yellow"), 4: ("↓ ", "dim")}
 
@@ -71,7 +74,10 @@ def idea_markdown(idea: Idea, plan: Plan) -> str:
 
 def plan_markdown(plan: Plan) -> str:
     goals = "\n".join(f"- {g}" for g in plan.goals) or "_No goals yet — press `s` to set them._"
-    return f"### {plan.name}\n\n{plan.start} → {plan.end}\n\n**Goals**\n\n{goals}"
+    md = f"### {plan.name}\n\n{window_label(plan.start, plan.end)}\n\n**Goals**\n\n{goals}"
+    if plan.background.strip():
+        md += f"\n\n**Background**\n\n{plan.background.strip()}"
+    return md
 
 
 def tilde(path: Path) -> str:
@@ -80,6 +86,48 @@ def tilde(path: Path) -> str:
         return "~/" + str(path.resolve().relative_to(Path.home()))
     except ValueError:
         return str(path)
+
+
+def folder_fingerprint(folder: Path, pattern: str) -> tuple:
+    """Cheap change detector for a folder: names and mtimes of matching files.
+    Polled rather than OS-watched to stay dependency-free; a planning folder
+    holds dozens of files, so a stat each every 1.5s costs nothing."""
+    try:
+        return tuple(sorted((p.name, p.stat().st_mtime_ns) for p in folder.glob(pattern)))
+    except FileNotFoundError:  # a file vanished mid-scan; next tick will settle
+        return ()
+
+
+class WatchedList(Screen):
+    """A list screen that redraws itself when its folder changes on disk
+    (an agent ran `mgr add`, a note was edited in vim, a plan was carried
+    over from the CLI)."""
+
+    def watched(self) -> tuple:
+        raise NotImplementedError
+
+    def selected_path(self) -> Path | None:
+        raise NotImplementedError
+
+    def refresh_list(self, select: Path | None = None) -> None:
+        raise NotImplementedError
+
+    def start_watching(self) -> None:
+        self._fingerprint = self.watched()
+        self.set_interval(1.5, self._poll)
+
+    def _poll(self) -> None:
+        # Only while visible; on_screen_resume covers changes made meanwhile.
+        if self.app.screen is not self:
+            return
+        fingerprint = self.watched()
+        if fingerprint != self._fingerprint:
+            self._fingerprint = fingerprint
+            self.refresh_list(select=self.selected_path())
+
+    def on_screen_resume(self) -> None:
+        self._fingerprint = self.watched()
+        self.refresh_list(select=self.selected_path())
 
 
 class IdeaList(OptionList):
@@ -290,6 +338,8 @@ class PlanEditor(FormScreen):
                 yield Input(p.linear_project, placeholder="optional", id="project", compact=True)
             yield Label("Goals (one per line)")
             yield TextArea("\n".join(p.goals), id="goals")
+            yield Label("Background (Markdown — context for the agent, not tickets)")
+            yield TextArea(p.background, language="markdown", soft_wrap=True, id="background")
             yield Label("[b]ctrl+s[/b] save   [b]esc[/b] cancel", classes="hint")
 
     def action_save(self) -> None:
@@ -316,6 +366,7 @@ class PlanEditor(FormScreen):
         p.linear_team = val("team")
         p.linear_project = val("project")
         p.goals = [g.strip() for g in self.query_one("#goals", TextArea).text.splitlines() if g.strip()]
+        p.background = self.query_one("#background", TextArea).text
         self.dismiss(True)
 
 
@@ -350,14 +401,16 @@ class BoardScreen(Screen):
         Binding("x", "export", "Export"),
         Binding("A", "app.edit_instructions(True)", "Agent rules", show=False),
         Binding("minus", "back", "Plans"),
+        Binding("slash", "app.search", "Search", show=False),
         Binding("escape", "close_quick_add", show=False),
         Binding("q", "app.quit", "Quit"),
     ]
 
-    def __init__(self, plan: Plan, path: Path) -> None:
+    def __init__(self, plan: Plan, path: Path, focus_idea: int | None = None) -> None:
         super().__init__()
         self.plan = plan
         self.path = path
+        self.focus_idea = focus_idea
         # Remembered selection per column so redraws don't jump the cursor.
         self.cursor_ids: dict[Status, int | None] = {}
         self.show_dropped = False
@@ -386,6 +439,10 @@ class BoardScreen(Screen):
         self.query_one(f"#col-{Status.DROPPED}").display = False
         self.refresh_board()
         self.list_for(Status.INBOX).focus()
+        if self.focus_idea is not None and (idea := self.plan.get(self.focus_idea)):
+            if idea.status == Status.DROPPED:
+                self.action_toggle_dropped()
+            self.select(idea)
         # Poll rather than use a file watcher: `mgr link` runs in another
         # process (usually driven by an LLM agent) and polling is dependency-free.
         self.set_interval(1.5, self.check_external_changes)
@@ -439,7 +496,7 @@ class BoardScreen(Screen):
             load = f"{committed:g} pts committed [dim](no capacity set)[/dim]"
         team = f" · team {p.linear_team}" if p.linear_team else ""
         self.query_one("#status-bar", Static).update(
-            f"[b]{p.name}[/b]  {p.start} → {p.end}{team}  ·  {load}  [dim]{self.path.name}[/dim]"
+            f"[b]{p.name}[/b]  {window_label(p.start, p.end)}{team}  ·  {load}  [dim]{self.path.name}[/dim]"
         )
 
     def refresh_detail(self) -> None:
@@ -463,20 +520,22 @@ class BoardScreen(Screen):
             self.undo_stack.append(self.saved_state)
             del self.undo_stack[:-200]
             self.redo_stack.clear()
-        if self._disk_mtime() != self.last_mtime:
-            # Someone (typically `mgr link`) wrote the file since we last
-            # looked. Absorb their Linear ids so our save doesn't erase them.
-            disk = model.load(self.path)
-            for disk_idea in disk.ideas:
-                ours = self.plan.get(disk_idea.id)
-                if ours and disk_idea.linear_id and not ours.linear_id:
-                    ours.linear_id = disk_idea.linear_id
+        if self._disk_mtime() != self.last_mtime and self.path.exists():
+            # Someone else (an agent running `mgr add`/`mgr link`, another
+            # board) wrote the file since our last save. Merge rather than
+            # overwrite, using our last save as the common ancestor.
+            self.plan = model.merge(Plan.from_dict(self.saved_state), self.plan, model.load(self.path))
         model.save(self.plan, self.path)
         self.last_mtime = self._disk_mtime()
         self.saved_state = self.plan.to_dict()
         self.refresh_board()
 
     def check_external_changes(self) -> None:
+        # While an editor dialog is open it holds references into self.plan;
+        # swapping the plan now would silently drop those edits. Wait — the
+        # save after the dialog closes merges in the external change instead.
+        if self.app.screen is not self:
+            return
         mtime = self._disk_mtime()
         if mtime is None or mtime == self.last_mtime:
             return
@@ -668,31 +727,102 @@ def export_path(plan_path: Path) -> Path:
     return plan_path.with_suffix(".handoff.md")
 
 
-class InstructionsEditor(FormScreen):
-    """Edits the plans folder's agent-instructions.md (team conventions)."""
+class MarkdownFileEditor(FormScreen):
+    """Edits a Markdown file in place: agent instructions and notes."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, title: str, hint: str = "") -> None:
         super().__init__()
         self.path = path
+        self.heading = title
+        self.hint = hint
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog wide"):
-            yield Label(f"Agent instructions — {tilde(self.path)}", classes="title", markup=False)
-            yield Label(
-                "Team conventions added to every handoff brief from this folder. "
-                "Text inside <!-- --> comments is ignored.",
-                classes="hint",
-                markup=False,
-            )
-            yield TextArea(self.path.read_text(), language="markdown", soft_wrap=True, id="instructions")
+            yield Label(f"{self.heading} — {tilde(self.path)}", classes="title", markup=False)
+            if self.hint:
+                yield Label(self.hint, classes="hint", markup=False)
+            yield TextArea(self.path.read_text(), language="markdown", soft_wrap=True, id="body")
             yield Label("[b]ctrl+s[/b] save   [b]esc[/b] cancel", classes="hint")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        # Start at the end: with notes you are usually appending.
+        area = self.query_one("#body", TextArea)
+        area.focus()
+        area.move_cursor(area.document.end)
+
     def action_save(self) -> None:
-        self.path.write_text(self.query_one("#instructions", TextArea).text)
+        self.path.write_text(self.query_one("#body", TextArea).text)
         self.dismiss(True)
 
 
-class PlanListScreen(Screen):
+class TextPrompt(ModalScreen[str | None]):
+    """One-line input dialog; dismisses with the text, or None on esc."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, question: str, placeholder: str = "") -> None:
+        super().__init__()
+        self.question = question
+        self.placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog small"):
+            yield Label(self.question)
+            yield Input(placeholder=self.placeholder, id="answer")
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PromoteScreen(ModalScreen[str | None]):
+    """Pick where a note goes: a new plan ("") or an existing plan's path."""
+
+    BINDINGS = [
+        Binding("escape,q", "cancel", "Cancel"),
+        Binding("j", "move('cursor_down')", show=False),
+        Binding("k", "move('cursor_up')", show=False),
+    ]
+
+    def __init__(self, folder: Path, note_title: str) -> None:
+        super().__init__()
+        self.folder = folder
+        self.note_title = note_title
+        self.targets = [""] + [str(f.path) for f in store.list_plans(folder) if f.plan]
+
+    def compose(self) -> ComposeResult:
+        options = [Option(Text("＋ New plan (next window)", "bold green"))]
+        for f in store.list_plans(self.folder):
+            if f.plan:
+                options.append(
+                    Option(Text.assemble((f"{window_label(f.plan.start, f.plan.end)}  ", "cyan"), f.plan.name))
+                )
+        with Vertical(classes="dialog"):
+            yield Label(f"Promote “{self.note_title}” to…", classes="title", markup=False)
+            yield OptionList(*options, id="targets")
+            yield Label(
+                "Bullets become Inbox ideas, `## Goals` bullets become goals, "
+                "and the note is added to the plan's Background.",
+                classes="hint",
+                markup=False,
+            )
+
+    @on(OptionList.OptionSelected)
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.targets[event.option_index])
+
+    def action_move(self, motion: str) -> None:
+        getattr(self.query_one("#targets", OptionList), f"action_{motion}")()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PlanListScreen(WatchedList):
     """The plans folder: pick, create, carry over, archive or delete plans."""
 
     BINDINGS = [
@@ -702,6 +832,8 @@ class PlanListScreen(Screen):
         Binding("a", "archive", "Archive"),
         Binding("D", "delete", "Delete"),
         Binding("A", "app.edit_instructions(False)", "Agent rules"),
+        Binding("tab", "app.switch_mode('notes')", "Notes"),
+        Binding("slash", "app.search", "Search"),
         Binding("j", "move('cursor_down')", show=False),
         Binding("k", "move('cursor_up')", show=False),
         Binding("g", "move('first')", show=False),
@@ -724,10 +856,13 @@ class PlanListScreen(Screen):
     def on_mount(self) -> None:
         self.refresh_list(select=store.current_plan(self.folder))
         self.query_one("#plans").focus()
+        self.start_watching()
 
-    def on_screen_resume(self) -> None:
-        # Coming back from a board: counts and names may have changed.
-        self.refresh_list(select=self.selected().path if self.selected() else None)
+    def watched(self) -> tuple:
+        return folder_fingerprint(self.folder, "*.json") + folder_fingerprint(self.folder, "*.md")
+
+    def selected_path(self) -> Path | None:
+        return f.path if (f := self.selected()) else None
 
     def selected(self) -> store.PlanFile | None:
         idx = self.query_one("#plans", OptionList).highlighted
@@ -743,7 +878,7 @@ class PlanListScreen(Screen):
             if f.plan is None:
                 text.append(f"{f.path.name}  unreadable", "red")
             else:
-                text.append(f"{f.plan.start} → {f.plan.end}  ", "cyan")
+                text.append(f"{window_label(f.plan.start, f.plan.end)}  ", "cyan")
                 text.append(f.plan.name, "bold")
                 text.append(f"  {store.summary(f.plan)}", "dim")
                 if f.path.stem != f.plan.start:
@@ -830,6 +965,272 @@ class PlanListScreen(Screen):
         self.app.push_screen(ConfirmScreen(f"Permanently delete {f.path.name} (and its handoff)?"), done)
 
 
+class NoteListScreen(WatchedList):
+    """Free-form notes, with promotion into plans."""
+
+    BINDINGS = [
+        Binding("n,o", "new", "New"),
+        Binding("e,i,l", "edit", "Edit"),
+        Binding("E", "external_edit", "$EDITOR"),
+        Binding("p", "promote", "Promote"),
+        Binding("a", "archive", "Archive"),
+        Binding("D", "delete", "Delete"),
+        Binding("w", "toggle_view", "Weeks/recent"),
+        Binding("tab", "app.switch_mode('plans')", "Plans"),
+        Binding("slash", "app.search", "Search"),
+        Binding("j", "move('cursor_down')", show=False),
+        Binding("k", "move('cursor_up')", show=False),
+        Binding("g", "move('first')", show=False),
+        Binding("G", "move('last')", show=False),
+        # Vim's paragraph motions, plus [ ] for keyboards where braces are awkward.
+        Binding("right_curly_bracket,right_square_bracket", "jump_week(1)", show=False),
+        Binding("left_curly_bracket,left_square_bracket", "jump_week(-1)", show=False),
+        Binding("q", "app.quit", "Quit"),
+    ]
+
+    def __init__(self, folder: Path) -> None:
+        super().__init__()
+        self.folder = folder
+        self.items: list[notes.Note] = []
+        # One entry per OptionList row: a Note, or None for a week heading.
+        self.rows: list[notes.Note | None] = []
+        self.by_week = True
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="status-bar")
+        yield OptionList(id="notes")
+        with VerticalScroll(id="detail"):
+            yield Markdown(id="note-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_list()
+        self.query_one("#notes").focus()
+        self.start_watching()
+
+    def watched(self) -> tuple:
+        return folder_fingerprint(notes.notes_dir(self.folder), "*.md")
+
+    def selected_path(self) -> Path | None:
+        return n.path if (n := self.selected()) else None
+
+    def selected(self) -> notes.Note | None:
+        idx = self.query_one("#notes", OptionList).highlighted
+        return self.rows[idx] if idx is not None and idx < len(self.rows) else None
+
+    @staticmethod
+    def _note_row(n: notes.Note, stamp: str) -> Option:
+        text = Text.assemble((f"{stamp}  ", "cyan"), (n.title, "bold"))
+        if promoted := n.promoted_to:
+            text.append(f"  → {', '.join(promoted)}", "green")
+        return Option(text)
+
+    def refresh_list(self, select: Path | None = None) -> None:
+        self.items = notes.list_notes(self.folder)
+        options: list[Option] = []
+        self.rows = []
+        if self.by_week:
+            for _, week in notes.group_by_week(self.items):
+                # Headings are disabled options: the cursor skips over them.
+                heading = notes.week_heading(week[0].created)
+                options.append(Option(Text(heading, "bold magenta"), disabled=True))
+                self.rows.append(None)
+                for n in week:
+                    options.append(self._note_row(n, f"  {n.created:%a %-d %b}"))
+                    self.rows.append(n)
+        else:
+            for n in self.items:
+                options.append(self._note_row(n, f"{n.modified:%Y-%m-%d %H:%M}"))
+                self.rows.append(n)
+
+        lst = self.query_one("#notes", OptionList)
+        lst.set_options(options)
+        paths = [n.path if n else None for n in self.rows]
+        if select is not None and select in paths:
+            lst.highlighted = paths.index(select)
+        elif any(paths):
+            lst.highlighted = next(i for i, p in enumerate(paths) if p is not None)
+        view = "by week" if self.by_week else "recently edited"
+        self.query_one("#status-bar", Static).update(
+            f"[b]Notes[/b]  {len(self.items)} note(s), {view}  ·  [dim]{tilde(notes.notes_dir(self.folder))}[/dim]"
+        )
+        self.refresh_detail()
+
+    def action_toggle_view(self) -> None:
+        self.by_week = not self.by_week
+        self.refresh_list(select=self.selected_path())
+
+    def action_jump_week(self, direction: int) -> None:
+        """Move to the first note of the next/previous week group."""
+        if not self.by_week:
+            return
+        lst = self.query_one("#notes", OptionList)
+        here = lst.highlighted or 0
+        headings = [i for i, row in enumerate(self.rows) if row is None]
+        # The heading of the week we're in is the last one before the cursor.
+        current = max((h for h in headings if h < here), default=0)
+        pos = headings.index(current) + direction if current in headings else 0
+        if 0 <= pos < len(headings):
+            lst.highlighted = headings[pos] + 1
+
+    def refresh_detail(self) -> None:
+        n = self.selected()
+        md = n.text if n else "_No notes yet — press `n` to write one._"
+        self.query_one("#note-detail", Markdown).update(md)
+
+    @on(OptionList.OptionHighlighted)
+    def _highlighted(self) -> None:
+        self.refresh_detail()
+
+    @on(OptionList.OptionSelected)
+    def _selected(self) -> None:
+        self.action_edit()
+
+    def action_move(self, motion: str) -> None:
+        getattr(self.query_one("#notes", OptionList), f"action_{motion}")()
+
+    def _edit(self, path: Path) -> None:
+        self.app.push_screen(MarkdownFileEditor(path, "Note"), lambda _: self.refresh_list(select=path))
+
+    def action_new(self) -> None:
+        def done(title: str | None) -> None:
+            if title:
+                path = notes.create_note(self.folder, title)
+                self.refresh_list(select=path)
+                self._edit(path)
+
+        self.app.push_screen(TextPrompt("New note title", "e.g. 1:1 with Sam, retro, idea dump"), done)
+
+    def action_edit(self) -> None:
+        if n := self.selected():
+            self._edit(n.path)
+
+    def action_external_edit(self) -> None:
+        n = self.selected()
+        if n is None:
+            return
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+        try:
+            with self.app.suspend():
+                # check=False: a non-zero exit (e.g. vim's :cq) just means
+                # "abandon edits", which the file on disk already reflects.
+                subprocess.run([*shlex.split(editor), str(n.path)], check=False)
+        except SuspendNotSupported:
+            self.notify("This terminal can't hand over to an external editor; use `e`", severity="error")
+        except FileNotFoundError:
+            self.notify(f"Editor not found: {editor!r} (check $VISUAL / $EDITOR)", severity="error")
+        self.refresh_list(select=n.path)
+
+    def action_promote(self) -> None:
+        n = self.selected()
+        if n is None:
+            return
+
+        def done(target: str | None) -> None:
+            if target is None:
+                return
+            plan_path, ex = notes.promote(n.path, Path(target) if target else None, self.folder)
+            self.notify(f"{len(ex.ideas)} idea(s), {len(ex.goals)} goal(s) → {plan_path.name}")
+            self.app.call_later(self.app.open_plan, plan_path)
+
+        self.app.push_screen(PromoteScreen(self.folder, n.title), done)
+
+    def action_archive(self) -> None:
+        if n := self.selected():
+            target = notes.archive_note(n.path)
+            self.refresh_list()
+            self.notify(f"Archived to {target.parent}")
+
+    def action_delete(self) -> None:
+        n = self.selected()
+        if n is None:
+            return
+
+        def done(confirmed: bool | None) -> None:
+            if confirmed:
+                n.path.unlink()
+                self.refresh_list()
+
+        self.app.push_screen(ConfirmScreen(f"Permanently delete note “{n.title}”?"), done)
+
+
+class SearchScreen(ModalScreen[search.Hit | None]):
+    """Live search across every plan and note; dismisses with the chosen hit."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        # The input keeps focus while these move the result cursor, so you can
+        # refine the query and pick a result without switching focus.
+        Binding("down,ctrl+j,ctrl+n", "move('cursor_down')", "Next", priority=True),
+        Binding("up,ctrl+k,ctrl+p", "move('cursor_up')", "Prev", priority=True),
+        Binding("ctrl+t", "toggle_archived", "Archived"),
+    ]
+
+    def __init__(self, folder: Path) -> None:
+        super().__init__()
+        self.folder = folder
+        self.hits: list[search.Hit] = []
+        self.include_archived = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog wide"):
+            yield Input(placeholder="Search ideas and notes — all words must match", id="query")
+            yield Static(id="search-status", classes="hint")
+            yield OptionList(id="results")
+            yield Label(
+                "[b]↑↓[/b]/[b]ctrl+j k[/b] move   [b]enter[/b] open   [b]ctrl+t[/b] include archived   [b]esc[/b] close",
+                classes="hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#query").focus()
+        self.run_search("")
+
+    @on(Input.Changed, "#query")
+    def _changed(self, event: Input.Changed) -> None:
+        # Searching every keystroke is fine: it reads a few hundred small files.
+        self.run_search(event.value)
+
+    def run_search(self, query: str) -> None:
+        self.hits = search.search(self.folder, query, include_archived=self.include_archived)
+        options = []
+        for hit in self.hits:
+            if hit.kind == "idea":
+                text = Text.assemble(("idea  ", "cyan"), hit.label)
+            else:
+                text = Text.assemble(("note  ", "magenta"), (hit.label, "bold"), (f"  {hit.path.name}", "dim"))
+            if hit.snippet and hit.snippet not in hit.label:
+                text.append(f"\n      {hit.snippet}", "dim")
+            options.append(Option(text))
+        lst = self.query_one("#results", OptionList)
+        lst.set_options(options)
+        if options:
+            lst.highlighted = 0
+        scope = " (incl. archived)" if self.include_archived else ""
+        status = f"{len(self.hits)} result(s){scope}" if query.strip() else f"Type to search{scope}"
+        self.query_one("#search-status", Static).update(status)
+
+    def action_move(self, motion: str) -> None:
+        getattr(self.query_one("#results", OptionList), f"action_{motion}")()
+
+    def action_toggle_archived(self) -> None:
+        self.include_archived = not self.include_archived
+        self.run_search(self.query_one("#query", Input).value)
+
+    @on(Input.Submitted, "#query")
+    def _submitted(self) -> None:
+        idx = self.query_one("#results", OptionList).highlighted
+        if idx is not None and idx < len(self.hits):
+            self.dismiss(self.hits[idx])
+
+    @on(OptionList.OptionSelected, "#results")
+    def _clicked(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.hits[event.option_index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class MgrApp(App):
     TITLE = "mgr"
     CSS = """
@@ -849,13 +1250,17 @@ class MgrApp(App):
     .dialog { width: 90; max-width: 95%; height: auto; max-height: 90%; border: thick $accent; background: $surface; padding: 1 2; }
     .dialog.small { width: 60; }
     .dialog.wide { width: 110; height: 90%; }
-    #instructions { height: 1fr; }
-    #plans { height: 1fr; border: none; padding: 0 1; }
+    #body { height: 1fr; }
+    #plans, #notes { height: 1fr; border: none; padding: 0 1; }
+    #targets { height: auto; max-height: 20; margin: 1 0; }
+    #results { height: 1fr; margin-top: 1; }
+    #query { margin-bottom: 0; }
     .dialog .title { text-style: bold; margin-bottom: 1; }
-    .dialog .hint { color: $text-muted; margin-top: 1; }
+    .dialog .hint { color: $text-muted; margin-top: 1; width: 100%; }
     .fields { grid-size: 2; grid-columns: 16 1fr; grid-rows: 1; grid-gutter: 1 0; height: auto; margin: 1 0; }
     #notes { height: 12; }
     #goals { height: 6; }
+    #background { height: 8; }
     """
 
     def __init__(self, folder: Path, open_path: Path | None = None) -> None:
@@ -863,17 +1268,57 @@ class MgrApp(App):
         self.folder = folder
         self.open_path = open_path
 
-    def on_mount(self) -> None:
-        # The picker is always the bottom screen so `-` from any board has
-        # somewhere to go back to, even when launched straight into a plan.
-        self.push_screen(PlanListScreen(self.folder))
+    async def on_mount(self) -> None:
+        # Plans and notes are separate modes, each with its own screen stack,
+        # so tabbing to notes and back returns to the same place. The picker
+        # is the bottom of the plans stack so `-` from any board has somewhere
+        # to go back to, even when launched straight into a plan.
+        self.add_mode("plans", lambda: PlanListScreen(self.folder))
+        self.add_mode("notes", lambda: NoteListScreen(self.folder))
+        await self.switch_mode("plans")
         if self.open_path is not None:
             self.push_screen(BoardScreen(model.load(self.open_path), self.open_path))
+
+    async def open_plan(self, path: Path, focus_idea: int | None = None) -> None:
+        """Show a plan's board on top of the plans picker, from any mode."""
+        await self.switch_mode("plans")
+        while len(self.screen_stack) > 1:
+            self.pop_screen()
+        if isinstance(self.screen, PlanListScreen):
+            self.screen.refresh_list(select=path)
+        self.push_screen(BoardScreen(model.load(path), path, focus_idea))
+
+    async def open_note(self, path: Path) -> None:
+        if path.parent != notes.notes_dir(self.folder):
+            # Archived notes aren't in the list; edit them in place instead.
+            self.push_screen(MarkdownFileEditor(path, "Archived note"))
+            return
+        await self.switch_mode("notes")
+        while len(self.screen_stack) > 1:
+            self.pop_screen()
+        if isinstance(self.screen, NoteListScreen):
+            self.screen.refresh_list(select=path)
+
+    def action_search(self) -> None:
+        def done(hit: search.Hit | None) -> None:
+            if hit is None:
+                return
+            if hit.kind == "idea":
+                self.call_later(self.open_plan, hit.path, hit.idea_id)
+            else:
+                self.call_later(self.open_note, hit.path)
+
+        self.push_screen(SearchScreen(self.folder), done)
 
     def action_edit_instructions(self, from_board: bool) -> None:
         # From a board, the rules that apply are those next to that plan.
         folder = self.screen.path.parent if from_board else self.folder
-        self.push_screen(InstructionsEditor(store.ensure_instructions(folder)), self._instructions_saved)
+        editor = MarkdownFileEditor(
+            store.ensure_instructions(folder),
+            "Agent instructions",
+            "Team conventions added to every handoff brief from this folder. Text inside <!-- --> comments is ignored.",
+        )
+        self.push_screen(editor, self._instructions_saved)
 
     def _instructions_saved(self, saved: bool | None) -> None:
         if saved:

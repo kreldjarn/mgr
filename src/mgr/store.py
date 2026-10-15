@@ -94,7 +94,7 @@ def unique_path(folder: Path, start: str) -> Path:
     return path
 
 
-def create_plan(folder: Path) -> Path:
+def create_plan(folder: Path, start: str | None = None, end: str | None = None) -> Path:
     """Create an empty plan for the window after the latest existing one.
 
     Team settings are copied from that plan, since they rarely change between
@@ -103,13 +103,22 @@ def create_plan(folder: Path) -> Path:
     plan = Plan()
     if plans:
         latest = plans[0]
-        start = date.fromisoformat(latest.end) + timedelta(days=1)
+        following = date.fromisoformat(latest.end) + timedelta(days=1)
         length = date.fromisoformat(latest.end) - date.fromisoformat(latest.start)
-        plan.start, plan.end = start.isoformat(), (start + length).isoformat()
+        plan.start, plan.end = following.isoformat(), (following + length).isoformat()
         plan.name = latest.name
         plan.capacity = latest.capacity
         plan.linear_team = latest.linear_team
         plan.linear_project = latest.linear_project
+    if start:
+        # An explicit start keeps the inferred window length unless end is given too.
+        length = date.fromisoformat(plan.end) - date.fromisoformat(plan.start)
+        plan.start = date.fromisoformat(start).isoformat()
+        plan.end = (date.fromisoformat(start) + length).isoformat()
+    if end:
+        plan.end = date.fromisoformat(end).isoformat()
+    if plan.end < plan.start:
+        raise ValueError(f"end {plan.end} is before start {plan.start}")
     path = unique_path(folder, plan.start)
     model.save(plan, path)
     return path

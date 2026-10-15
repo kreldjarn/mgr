@@ -25,20 +25,27 @@ Re-run the same command to upgrade. From a clone, run `./install.sh` instead
 If you keep plans somewhere other than `~/.local/share/mgr`, set `MGR_DIR`
 before installing, so the skill points at the right folder.
 
-To uninstall: `uv tool uninstall mgr && rm -r ~/.claude/skills/mgr-linear-handoff`.
+To uninstall: `uv tool uninstall mgr && rm -r ~/.claude/skills/mgr-*`.
 
 ## Usage
 
 ```
-mgr                       # plan picker for the plans folder
-mgr --plan 2026-10-19     # open a plan directly (name or path)
-mgr ls                    # list plans; * marks the current one
-mgr new                   # empty plan for the window after the latest
-mgr export [-o FILE]      # LLM handoff brief to stdout / FILE
-mgr link 12 ENG-345        # record that mgr-12 became ENG-345
-mgr carry [NEW] [--open]  # start the next window from unfinished ideas
-mgr instructions          # path of the agent instructions file
-mgr skill [--install]     # Claude Code skill for creating the tickets
+mgr                         # home: plans tab (tab switches to notes)
+mgr --plan 2026-10-19       # open a plan directly (name or path)
+mgr ls                      # list plans; * marks the current one
+mgr show                    # a plan with every idea and its mgr-N id
+mgr new [--weeks 45-46]     # new plan (default: the window after the latest)
+mgr add TITLE [--notes -]   # add an idea (inbox by default; see --help)
+mgr search WORDS [--all]    # ideas and notes containing all WORDS
+mgr notes                   # list notes
+mgr note TITLE [--body -]   # create a note (- reads stdin)
+mgr append NOTE --body -    # append to a note
+mgr promote NOTE [--into P] # turn a note into a plan, or add it to one
+mgr export [-o FILE]        # LLM handoff brief to stdout / FILE
+mgr link 12 ENG-345         # record that mgr-12 became ENG-345
+mgr carry [NEW] [--open]    # start the next window from unfinished ideas
+mgr instructions            # path of the agent instructions file
+mgr skill [--install]       # the Claude Code skills
 ```
 
 Plans live in `~/.local/share/mgr` (override with `--dir` or `$MGR_DIR`, e.g. a
@@ -52,14 +59,51 @@ latest.
 2026-10-19.json            one plan per window, named by start date
 2026-10-19.handoff.md      last export of that plan
 agent-instructions.md      team conventions for the ticket-creating agent
+notes/                     free-form Markdown notes (notes/archive/ too)
 archive/                   archived plans (with their handoffs)
 ```
+
+Windows are shown with ISO (Swedish) week numbers, e.g.
+`2026-10-19 → 2026-11-01 · v.43–44`.
 
 `mgr` opens on the plan picker. `enter`/`l` opens a plan, `n` creates the next
 window's plan (copying team, project and capacity from the latest), `c` carries
 the selected plan over, `a` archives it, `D` deletes it (asks first), and `A`
 edits the agent instructions. On a board, `-` returns to the picker.
 Unreadable files are listed rather than hidden, so a bad hand edit is obvious.
+
+Everything is plain files, and every screen keeps up with changes on disk. The
+lists redraw when files appear or change, and an open board merges outside
+edits (e.g. Claude adding ideas, `mgr link`) into yours instead of
+overwriting them. If both sides changed the same field, your edit wins.
+
+## Notes
+
+`tab` on the home screen switches to **Notes**: free-form Markdown in
+`notes/`, for meeting takeaways, decisions and half-formed ideas. `n` creates
+one, `e` edits it in the built-in editor, `E` opens it in `$VISUAL`/`$EDITOR`,
+and `a`/`D` archive or delete it.
+
+Notes are grouped by ISO week (`v.42 · 12–18 Oct 2026 · this week`), dated by
+the `YYYY-MM-DD` prefix of their file name. `}`/`{` (or `]`/`[`) jump to the
+next or previous week, and `w` toggles to a flat "recently edited" list.
+
+`p` **promotes** a note into a new plan or an existing one:
+
+```markdown
+# Retrieval offsite           → plan name (new plans)
+## Goals
+- Ship retrieval eval v1      → plan goal
+## Ideas
+- Build golden query set      → Inbox idea
+  - 200 queries, two labellers → …with this as its notes
+- [ ] Profile reranker        → Inbox idea
+- [x] Done already            → skipped
+```
+
+The whole note is also added to the plan's **Background**, which the handoff
+brief passes to the agent as context. A promoted note gets a visible
+`> Promoted to 2026-11-02.json` line.
 
 ## Agent instructions
 
@@ -77,13 +121,32 @@ Two layers tell the ticket-creating agent what to do:
   `<!-- -->` is ignored, so the starter examples have no effect until you move
   them out of the comment.
 
-For Claude Code, `mgr skill --install` writes a skill to
-`~/.claude/skills/mgr-linear-handoff/`. Any session can then handle "create the
-Linear tickets from my plan": it finds the current plan with `mgr ls`, fetches
-the brief, and follows it. The skill only knows how to fetch the brief, so
-editing conventions never requires reinstalling it. Reinstall only if the plans
-folder or the `mgr` install location changes, because the skill embeds both
-paths.
+## Search
+
+`/` from the plans list, the notes list or a board opens search across every
+plan and note. Results update as you type; all words must match, in any
+order. `↑↓` or `ctrl+j`/`ctrl+k` move through the results without leaving the
+input. `enter` jumps to the result: for an idea, its plan's board with the
+cursor on it; for a note, the note in the notes list. `ctrl+t` includes
+archived plans and notes. `mgr search` does the same from the shell.
+
+## Using mgr from Claude Code
+
+`install.sh` (or `mgr skill --install`) installs two skills to
+`~/.claude/skills/`, so any Claude Code session can work with your plans:
+
+- **mgr-planning**: "note down what we decided about X", "add these three
+  things to the plan", "make a plan for weeks 45–46 from this", "what's in my
+  plan about reranking?". It uses the CLI (`note`, `append`, `add`, `new`,
+  `show`, `search`, `promote`) and never edits files directly. Ideas go to
+  Inbox unless you say otherwise, and it's told to write notes that make sense
+  later, without the conversation.
+- **mgr-linear-handoff**: "create the Linear tickets from my plan". It finds
+  the current plan, fetches the brief, and follows it.
+
+The skills only describe how to call the CLI, so editing conventions never
+requires reinstalling them. Reinstall only if the plans folder or the `mgr`
+install location changes, because the skills embed both paths.
 
 ## Workflow
 
@@ -134,6 +197,7 @@ Vim-style throughout; arrow keys work too.
 | `z` | show/hide the *Dropped* column |
 | `s` | plan settings (dates, capacity, goals, Linear team) |
 | `x` | export handoff brief |
+| `/` | search plans and notes |
 | `A` | edit agent instructions |
 | `-` | back to the plan picker |
 | `q` | quit |

@@ -8,12 +8,13 @@ back so a second run never creates duplicates.
 
 from __future__ import annotations
 
+import re
 import shlex
 import shutil
 import sys
 from pathlib import Path
 
-from mgr.model import PRIORITIES, Idea, Plan, Status
+from mgr.model import PRIORITIES, Idea, Plan, Status, window_label
 
 
 def _fmt_points(points: float | None) -> str:
@@ -93,6 +94,40 @@ def _ticket_block(idea: Idea, plan: Plan, all_ids: dict[int, Idea]) -> str:
     return "\n".join(lines)
 
 
+def overview(plan: Plan) -> str:
+    """Every idea in every column, with ids — for an agent to read before
+    adding to a plan (to avoid duplicates) or to answer questions about it."""
+    cap = f"/{plan.capacity:g}" if plan.capacity else ""
+    out = [
+        f"# {plan.name}",
+        "",
+        f"{window_label(plan.start, plan.end)} · team {plan.linear_team or '-'} · {plan.committed_points():g}{cap} pts committed",
+        "",
+    ]
+    if plan.goals:
+        out += ["## Goals", "", *(f"- {g}" for g in plan.goals), ""]
+    for status in [Status.INBOX, Status.MAYBE, Status.COMMITTED, Status.PARKED, Status.DROPPED]:
+        ideas = plan.in_status(status)
+        out += [f"## {status.capitalize()} ({len(ideas)})", ""]
+        for i in ideas:
+            meta = [f"P{i.priority}", i.kind]
+            if i.estimate is not None:
+                meta.append(f"{i.estimate:g}p")
+            if i.assignee:
+                meta.append(f"@{i.assignee}")
+            if i.parent is not None:
+                meta.append(f"parent mgr-{i.parent}")
+            if i.linear_id:
+                meta.append(i.linear_id)
+            out.append(f"- mgr-{i.id}: {i.title}  [{', '.join(meta)}]")
+            if i.notes.strip():
+                out += [f"    {line}" if line else "" for line in i.notes.strip().splitlines()]
+        out.append("")
+    if plan.background.strip():
+        out += ["## Background", "", plan.background.strip(), ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
 def render(plan: Plan, plan_path: Path, conventions: str = "") -> str:
     """`conventions` is free-form Markdown from the plans folder's agent
     instructions file (see `store.load_instructions`)."""
@@ -116,7 +151,7 @@ def render(plan: Plan, plan_path: Path, conventions: str = "") -> str:
     out: list[str] = []
     out.append(f"# Planning handoff: {plan.name}")
     out.append("")
-    out.append(f"- **Window**: {plan.start} → {plan.end}")
+    out.append(f"- **Window**: {window_label(plan.start, plan.end)}")
     out.append(f"- **Linear team**: {team}")
     if plan.linear_project:
         out.append(f"- **Default Linear project**: {plan.linear_project}")
@@ -128,6 +163,15 @@ def render(plan: Plan, plan_path: Path, conventions: str = "") -> str:
         out.append("## Goals for this window")
         out.append("")
         out += [f"- {g}" for g in plan.goals]
+        out.append("")
+
+    if plan.background.strip():
+        out.append("## Background")
+        out.append("")
+        out.append("_Context for writing good descriptions. Do not create tickets from this section._")
+        out.append("")
+        # Demote headings so a note's "## Goals" can't pose as a brief section.
+        out.append(re.sub(r"^(#{1,4}) ", r"##\1 ", plan.background.strip(), flags=re.MULTILINE))
         out.append("")
 
     out.append("## Instructions for the assistant")

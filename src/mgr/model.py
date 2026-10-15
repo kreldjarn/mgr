@@ -16,6 +16,40 @@ from enum import StrEnum
 from pathlib import Path
 
 
+def week_label(start: str, end: str) -> str:
+    """ISO 8601 week numbers for a window, Swedish style: "v.43", "v.43–44",
+    or "v.52–1" across a new year. ISO weeks start on Monday and week 1 is
+    the week containing the year's first Thursday — the Swedish convention,
+    which is exactly what `date.isocalendar()` implements."""
+    first = date.fromisoformat(start).isocalendar().week
+    last = date.fromisoformat(end).isocalendar().week
+    return f"v.{first}" if first == last else f"v.{first}–{last}"
+
+
+def weeks_to_window(spec: str, today: date | None = None) -> tuple[str, str]:
+    """ "45" or "45-46" → (Monday of the first week, Sunday of the last).
+
+    Week numbers name the *next* occurrence: in December, "2" means week 2
+    of the coming year, since nobody plans weeks that are already over.
+    """
+    first_s, _, last_s = spec.replace("–", "-").partition("-")
+    first, last = int(first_s), int(last_s or first_s)
+    today = today or date.today()
+    year = today.isocalendar().year
+    start = date.fromisocalendar(year, first, 1)
+    if start + timedelta(days=6) < today:
+        year += 1
+        start = date.fromisocalendar(year, first, 1)
+    # A range like 52-1 wraps into the following ISO year.
+    end_year = year + 1 if last < first else year
+    end = date.fromisocalendar(end_year, last, 7)
+    return start.isoformat(), end.isoformat()
+
+
+def window_label(start: str, end: str) -> str:
+    return f"{start} → {end} · {week_label(start, end)}"
+
+
 class Status(StrEnum):
     INBOX = "inbox"
     MAYBE = "maybe"
@@ -87,6 +121,9 @@ class Plan:
     end: str = field(default_factory=_default_end)
     capacity: float = 0
     goals: list[str] = field(default_factory=list)
+    # Free-form context for the window (e.g. promoted notes); exported so the
+    # ticket-creating agent can write better descriptions.
+    background: str = ""
     linear_team: str = ""
     linear_project: str = ""
     ideas: list[Idea] = field(default_factory=list)
@@ -206,3 +243,54 @@ def carry_over(plan: Plan) -> Plan:
             idea.parent = None
         nxt.ideas.append(idea)
     return nxt
+
+
+def merge(base: Plan, ours: Plan, theirs: Plan) -> Plan:
+    """Three-way merge of a plan: `ours` (in-memory edits) and `theirs` (the
+    file on disk, changed by another process such as an agent running the
+    CLI) both descend from `base` (the last state we saved).
+
+    Field-level, so concurrent edits to *different* fields of the same idea
+    both survive (e.g. we move an idea while an agent links it to Linear).
+    Where both sides changed the same field, ours wins: the person at the
+    board is the one looking at it.
+    """
+    b, o, t = base.to_dict(), ours.to_dict(), theirs.to_dict()
+
+    def pick(bv: dict, ov: dict, tv: dict, key: str):
+        return ov.get(key) if ov.get(key) != bv.get(key) else tv.get(key)
+
+    merged = {k: pick(b, o, t, k) for k in o if k not in ("ideas", "next_id")}
+
+    b_ideas = {i["id"]: i for i in b["ideas"]}
+    t_ideas = {i["id"]: i for i in t["ideas"]}
+    o_ids = {i["id"] for i in o["ideas"]}
+    ideas: list[dict] = []
+    for oi in o["ideas"]:
+        bi, ti = b_ideas.get(oi["id"]), t_ideas.get(oi["id"])
+        if bi is None:
+            ideas.append(oi)  # new on our side
+        elif ti is None:
+            # Deleted on disk: honour that unless we edited it meanwhile.
+            if oi != bi:
+                ideas.append(oi)
+        else:
+            ideas.append({k: pick(bi, oi, ti, k) for k in oi})
+    # Ideas added on disk. If an id collides with one we just created, ours
+    # moves: theirs may already have been reported (e.g. "added mgr-12"),
+    # while ours was created moments ago and nobody has seen its number.
+    theirs_new = [ti for ti in t["ideas"] if ti["id"] not in b_ideas]
+    clashing = {ti["id"] for ti in theirs_new} & o_ids
+    next_id = max([o["next_id"], t["next_id"], *(i["id"] + 1 for i in ideas + theirs_new)])
+    for idea in ideas:
+        if idea["id"] in clashing:
+            for child in ideas:  # keep our own parent links pointing at it
+                if child["parent"] == idea["id"] and child["id"] not in b_ideas:
+                    child["parent"] = next_id
+            idea["id"] = next_id
+            next_id += 1
+    ideas += theirs_new
+
+    merged["ideas"] = ideas
+    merged["next_id"] = max([next_id, *(i["id"] + 1 for i in ideas)])
+    return Plan.from_dict(merged)
